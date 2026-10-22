@@ -429,6 +429,11 @@ void pad_thread::update_pad_states()
 
 void pad_thread::operator()()
 {
+	// Slight priority boost: this thread detects physical key/pad presses (including taiko
+	// hits), so scheduling jitter here directly becomes input jitter. Same pattern as the
+	// audio thread (cellAudio.cpp).
+	thread_ctrl::scoped_priority high_prio(+1);
+
 	Init();
 
 	const bool is_vsh = Emu.IsVsh();

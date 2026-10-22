@@ -7,7 +7,11 @@
 #include "rpcs3qt/gs_frame.h"
 
 #include <algorithm>
+#include <atomic>
 #include <QApplication>
+
+// Taiko hit flags, defined in usio.cpp
+extern std::atomic<u32> g_taiko_pending[2][4];
 
 bool keyboard_pad_handler::Init()
 {
@@ -1183,7 +1187,7 @@ bool keyboard_pad_handler::bindPadToDevice(std::shared_ptr<Pad> pad)
 void keyboard_pad_handler::process()
 {
 	constexpr double stick_interval = 10.0;
-	constexpr double button_interval = 10.0;
+	constexpr double button_interval = 0.1; // Lowered from 10.0 to cut input capture latency
 
 	const auto now = steady_clock::now();
 
@@ -1351,6 +1355,61 @@ void keyboard_pad_handler::process()
 		ensure(cfg);
 
 		const Pad& pad_internal = m_pads_internal[i];
+
+		// Taiko hit capture: detected here, at raw input-poll time, and latched into a
+		// per-lane flag that usio.cpp's translate_input_taiko() consumes. Doing this here
+		// instead of in translate_input_taiko() means a hit occurring between two USIO polls
+		// (the game polls much slower than a player can hit the drum) is not lost.
+		static std::vector<std::vector<bool>> last_pressed_states;
+		if (last_pressed_states.size() < m_bindings.size())
+		{
+			last_pressed_states.resize(m_bindings.size());
+		}
+		if (last_pressed_states[i].size() < pad_internal.m_buttons.size())
+		{
+			last_pressed_states[i].resize(pad_internal.m_buttons.size(), false);
+		}
+
+		for (usz b = 0; b < pad_internal.m_buttons.size(); ++b)
+		{
+			const bool is_pressed = pad_internal.m_buttons[b].m_pressed;
+
+			if (is_pressed && !last_pressed_states[i][b])
+			{
+				int lane = -1;
+				const u32 code = pad_internal.m_buttons[b].m_outKeyCode;
+
+				// Face buttons (primary taiko hit mapping)
+				if (code == CELL_PAD_CTRL_SQUARE)
+					lane = 0; // Taiko Hit Side Left
+				else if (code == CELL_PAD_CTRL_TRIANGLE)
+					lane = 1; // Taiko Hit Center Left
+				else if (code == CELL_PAD_CTRL_CROSS)
+					lane = 2; // Taiko Hit Center Right
+				else if (code == CELL_PAD_CTRL_CIRCLE)
+					lane = 3; // Taiko Hit Side Right
+				// D-Pad (secondary taiko hit mapping)
+				else if (code == CELL_PAD_CTRL_LEFT)
+					lane = 0;
+				else if (code == CELL_PAD_CTRL_UP)
+					lane = 1;
+				else if (code == CELL_PAD_CTRL_DOWN)
+					lane = 2;
+				else if (code == CELL_PAD_CTRL_RIGHT)
+					lane = 3;
+
+				if (lane != -1)
+				{
+					const u32 player_idx = pad->m_player_id;
+					if (player_idx < 2)
+					{
+						g_taiko_pending[player_idx][lane].store(1, std::memory_order_release);
+					}
+				}
+			}
+
+			last_pressed_states[i][b] = is_pressed;
+		}
 
 		// Normalize and apply pad squircling
 		// Copy sticks first. We don't want to modify the raw internal values

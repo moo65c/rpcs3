@@ -8,6 +8,24 @@
 #include "Emu/IdManager.h"
 #include "Emu/system_config.h"
 
+#include <atomic>
+
+// Taiko hits are latched the instant they are seen in keyboard_pad_handler::process()
+// (raw input-poll time) instead of being edge-detected once per translate_input_taiko()
+// call. This avoids losing hits that happen between two USIO polls when the game polls
+// slower than the player can hit the drum.
+//
+// This is a lock-free SPSC (single producer / single consumer) *flag* per lane, not a
+// counter: keyboard_pad_handler::process() is the only producer (store(1) on a fresh
+// press) and translate_input_taiko() is the only consumer (exchange(0) when reporting a
+// hit). Each lane is reported to the game as a single value that flips between two
+// levels (see value_states below), so one poll can only ever communicate ONE hit-edge
+// per lane no matter how many physical hits happened since the last poll. Queueing a
+// backlog and draining it one-per-poll would only report real hits later and later, so
+// the most recent hit is reported immediately and any extra, unrepresentable hits are
+// dropped. No mutex, no heap allocation, no contention between the pad and USB threads.
+std::atomic<u32> g_taiko_pending[2][4]{};
+
 LOG_CHANNEL(usio_log, "USIO");
 
 template <>
@@ -217,8 +235,22 @@ void usb_device_usio::translate_input_taiko()
 	const auto handler = pad::get_pad_thread();
 
 	response.assign(0x60, 0);
-	constexpr le_t<u16> c_hit = 0x1800;
 	le_t<u16> digital_input = 0;
+
+	// Taiko hits are reported to the game with an alternating analog level (50/51) so
+	// consecutive hits can be told apart even if the previous value hasn't been re-read yet.
+	static bool value_states[2][4] = {};
+
+	const auto fire_hit = [&](u8* ptr, usz player, usz lane)
+	{
+		bool& state = value_states[player][lane];
+		const u16 hit_val = state ? 51 : 50;
+		state = !state;
+
+		const u16 analog_val = (hit_val << 15) / 100 + 1;
+		const le_t<u16> out = analog_val;
+		std::memcpy(ptr, &out, sizeof(u16));
+	};
 
 	const auto translate_from_pad = [&](usz pad_number, usz player)
 	{
@@ -261,24 +293,12 @@ void usb_device_usio::translate_input_taiko()
 						digital_input |= 0x1000;
 					break;
 				case usio_btn::taiko_hit_side_left:
-					if (value.pressed && !status.taiko_hit_already[0])
-						std::memcpy(response.data() + 32 + offset, &c_hit, sizeof(u16));
-					status.taiko_hit_already[0] = value.pressed;
-					break;
-				case usio_btn::taiko_hit_center_right:
-					if (value.pressed && !status.taiko_hit_already[1])
-						std::memcpy(response.data() + 36 + offset, &c_hit, sizeof(u16));
-					status.taiko_hit_already[1] = value.pressed;
-					break;
-				case usio_btn::taiko_hit_side_right:
-					if (value.pressed && !status.taiko_hit_already[2])
-						std::memcpy(response.data() + 38 + offset, &c_hit, sizeof(u16));
-					status.taiko_hit_already[2] = value.pressed;
-					break;
 				case usio_btn::taiko_hit_center_left:
-					if (value.pressed && !status.taiko_hit_already[3])
-						std::memcpy(response.data() + 34 + offset, &c_hit, sizeof(u16));
-					status.taiko_hit_already[3] = value.pressed;
+				case usio_btn::taiko_hit_center_right:
+				case usio_btn::taiko_hit_side_right:
+					// Taiko hits are latched at raw input-poll time in
+					// keyboard_pad_handler::process() and consumed from g_taiko_pending
+					// below, so there is nothing to do with them here.
 					break;
 				case usio_btn::card_tapping:
 					if (value.pressed)
@@ -289,9 +309,34 @@ void usb_device_usio::translate_input_taiko()
 				}
 			});
 		}
+		else if (player < 2)
+		{
+			// Controller disconnected: reset the alternating-value state and drop any
+			// pending hits so a reconnect doesn't fire a stale hit or start on the wrong
+			// alternating value.
+			for (usz lane = 0; lane < 4; lane++)
+			{
+				value_states[player][lane] = false;
+				g_taiko_pending[player][lane].store(0, std::memory_order_relaxed);
+			}
+		}
 
 		if (player == 0 && status.test_on)
 			digital_input |= 0x80;
+
+		if (player < 2)
+		{
+			static constexpr usz byte_offset[4] = {32, 34, 36, 38};
+
+			// At most one hit per lane per call, reporting the *most recent* press.
+			for (usz lane = 0; lane < 4; lane++)
+			{
+				if (g_taiko_pending[player][lane].exchange(0, std::memory_order_acq_rel))
+				{
+					fire_hit(response.data() + byte_offset[lane] + offset, player, lane);
+				}
+			}
+		}
 	};
 
 	for (usz i = 0; i < m_io_status.size(); i++)

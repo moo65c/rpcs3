@@ -656,6 +656,11 @@ usb_handler_thread::~usb_handler_thread()
 
 void usb_handler_thread::operator()()
 {
+	// Slight priority boost: this thread delivers USIO/taiko input completions to the game,
+	// so scheduling jitter here directly becomes input jitter. Same pattern as the audio
+	// thread (cellAudio.cpp).
+	thread_ctrl::scoped_priority high_prio(+1);
+
 	timeval lusb_tv{0, 0};
 	if (!hotplug_supported)
 	{

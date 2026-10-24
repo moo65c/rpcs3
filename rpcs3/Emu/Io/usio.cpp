@@ -9,6 +9,7 @@
 #include "Emu/system_config.h"
 
 #include <atomic>
+#include <mutex> // still needed for the pre-existing pad::g_pad_mutex lock_guard usage below
 
 // Taiko hits are latched the instant they are seen in keyboard_pad_handler::process()
 // (raw input-poll time) instead of being edge-detected once per translate_input_taiko()
@@ -243,6 +244,9 @@ void usb_device_usio::translate_input_taiko()
 
 	const auto fire_hit = [&](u8* ptr, usz player, usz lane)
 	{
+		if (!ptr)
+			return;
+
 		bool& state = value_states[player][lane];
 		const u16 hit_val = state ? 51 : 50;
 		state = !state;
@@ -932,8 +936,11 @@ void usb_device_usio::interrupt_transfer(u32 buf_size, u8* buf, u32 endpoint, Us
 
 	transfer->fake            = true;
 	transfer->expected_result = HC_CC_NOERR;
-	// The latency varies per operation but it doesn't seem to matter for this device so let's go fast!
-	transfer->expected_time = get_timestamp() + 1'000;
+	// NOTE: do NOT add an artificial delay here (e.g. get_timestamp() + 1'000).
+	// This transfer carries the controller/taiko input state back to the game, so any
+	// added latency here is added latency on every single input poll. This transfer
+	// is completed immediately to keep input latency at zero.
+	transfer->expected_time = get_timestamp();
 
 	is_used = true;
 
